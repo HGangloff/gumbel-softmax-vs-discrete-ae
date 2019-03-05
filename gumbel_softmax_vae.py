@@ -79,36 +79,70 @@ def gumbel_softmax(logits, temperature, hard=False):
     return y_hard.view(-1, latent_dim * categorical_dim)
 
 
-class VAE_gumbel(nn.Module):
-    def __init__(self, temp):
-        super(VAE_gumbel, self).__init__()
+class AutoencoderBase(nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
 
         self.fc1 = nn.Linear(784, 512)
         self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, latent_dim * categorical_dim)
+        self.fc3 = nn.Linear(256, hidden_dim)
 
-        self.fc4 = nn.Linear(latent_dim * categorical_dim, 256)
+        self.fc4 = nn.Linear(hidden_dim, 256)
         self.fc5 = nn.Linear(256, 512)
         self.fc6 = nn.Linear(512, 784)
 
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
 
-    def encode(self, x):
-        h1 = self.relu(self.fc1(x))
+    def encode(self, inp):
+        h1 = self.relu(self.fc1(inp))
         h2 = self.relu(self.fc2(h1))
         return self.relu(self.fc3(h2))
 
-    def decode(self, z):
-        h4 = self.relu(self.fc4(z))
+    def decode(self, latent):
+        h4 = self.relu(self.fc4(latent))
         h5 = self.relu(self.fc5(h4))
         return self.sigmoid(self.fc6(h5))
 
-    def forward(self, x, temp, hard):
-        q = self.encode(x.view(-1, 784))
-        q_y = q.view(q.size(0), latent_dim, categorical_dim)
-        z = gumbel_softmax(q_y, temp, hard)
-        return self.decode(z), F.softmax(q_y, dim=-1).reshape(*q.size())
+    def latent(self, hidden):
+        raise NotImplementedError
+
+    def prior_loss(self, hidden):
+        return 0.0
+
+    def forward(self, inp, *latent_args, **latent_kwargs):
+        hidden = self.encode(inp.view(-1, 784))
+        latent = self.latent(hidden, *latent_args, **latent_kwargs)
+        return (self.decode(latent), self.prior_loss(hidden))
+
+
+class DiscreteAutoencoderBase(AutoencoderBase):
+
+    def __init__(self, latent_dim, categorical_dim):
+        super().__init__(latent_dim * categorical_dim)
+        self.latent_dim = latent_dim
+        self.categorical_dim = categorical_dim
+
+    def _logits(self, hidden):
+        return hidden.view(hidden.size(0), self.latent_dim, self.categorical_dim)
+
+
+class GumbelSoftmaxAutoencoder(DiscreteAutoencoderBase):
+
+    def latent(self, hidden, temp, hard):
+        return gumbel_softmax(self._logits(hidden), temp, hard)
+
+    def prior_loss(self, hidden):
+        posterior = F.softmax(self._logits(hidden), dim=-1).reshape(*hidden.size())
+        log_ratio = torch.log(posterior * self.categorical_dim + 1e-20)
+        return torch.sum(posterior * log_ratio, dim=-1).mean()
+
+
+class DiscreteAutoencoder(DiscreteAutoencoderBase):
+
+    def latent(self, hidden):
+        raise NotImplementedError
 
 
 latent_dim = 30
@@ -117,20 +151,16 @@ categorical_dim = 10  # one-of-K vector
 temp_min = 0.5
 ANNEAL_RATE = 0.00003
 
-model = VAE_gumbel(args.temp)
+model = GumbelSoftmaxAutoencoder(latent_dim, categorical_dim)
 if args.cuda:
     model.cuda()
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 
 # Reconstruction + KL divergence losses summed over all elements and batch
-def loss_function(recon_x, x, qy):
+def loss_function(recon_x, x, prior_loss):
     BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), size_average=False) / x.shape[0]
-
-    log_ratio = torch.log(qy * categorical_dim + 1e-20)
-    KLD = torch.sum(qy * log_ratio, dim=-1).mean()
-
-    return BCE + KLD
+    return BCE + prior_loss
 
 
 def train(epoch, temp):
@@ -140,8 +170,8 @@ def train(epoch, temp):
         if args.cuda:
             data = data.cuda()
         optimizer.zero_grad()
-        recon_batch, qy = model(data, temp, args.hard)
-        loss = loss_function(recon_batch, data, qy)
+        recon_batch, prior_loss = model(data, temp, args.hard)
+        loss = loss_function(recon_batch, data, prior_loss)
         loss.backward()
         train_loss += loss.item() * len(data)
         optimizer.step()
@@ -166,8 +196,8 @@ def test(epoch):
     for i, (data, _) in enumerate(test_loader):
         if args.cuda:
             data = data.cuda()
-        recon_batch, qy = model(data, temp_min, args.hard)
-        test_loss += loss_function(recon_batch, data, qy).item() * len(data)
+        recon_batch, prior_loss = model(data, temp_min, args.hard)
+        test_loss += loss_function(recon_batch, data, prior_loss).item() * len(data)
         if i == 0:
             n = min(data.size(0), 8)
             comparison = torch.cat([data[:n],
