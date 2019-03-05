@@ -133,10 +133,9 @@ def loss_function(recon_x, x, qy):
     return BCE + KLD
 
 
-def train(epoch):
+def train(epoch, temp):
     model.train()
     train_loss = 0
-    temp = args.temp
     for batch_idx, (data, _) in enumerate(train_loader):
         if args.cuda:
             data = data.cuda()
@@ -147,29 +146,28 @@ def train(epoch):
         train_loss += loss.item() * len(data)
         optimizer.step()
         if batch_idx % 100 == 1:
-            temp = np.maximum(temp * np.exp(-ANNEAL_RATE * batch_idx), temp_min)
+            temp = np.maximum(temp * np.exp(-ANNEAL_RATE * 100), temp_min)
 
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f} Temperature: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                        100. * batch_idx / len(train_loader),
-                       loss.item()))
+                       loss.item(), temp))
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(
         epoch, train_loss / len(train_loader.dataset)))
+
+    return temp
 
 
 def test(epoch):
     model.eval()
     test_loss = 0
-    temp = args.temp
     for i, (data, _) in enumerate(test_loader):
         if args.cuda:
             data = data.cuda()
-        recon_batch, qy = model(data, temp, args.hard)
+        recon_batch, qy = model(data, temp_min, args.hard)
         test_loss += loss_function(recon_batch, data, qy).item() * len(data)
-        if i % 100 == 1:
-            temp = np.maximum(temp * np.exp(-ANNEAL_RATE * i), temp_min)
         if i == 0:
             n = min(data.size(0), 8)
             comparison = torch.cat([data[:n],
@@ -182,8 +180,9 @@ def test(epoch):
 
 
 def run():
+    temp = args.temp
     for epoch in range(1, args.epochs + 1):
-        train(epoch)
+        temp = train(epoch, temp)
         test(epoch)
 
         M = 64 * latent_dim
