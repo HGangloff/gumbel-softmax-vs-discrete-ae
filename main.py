@@ -4,6 +4,8 @@
 # tensorflow implementation of gumble-softmax by Eric Jang.
 
 import argparse
+import copy
+import functools
 import numpy as np
 
 import torch
@@ -46,6 +48,13 @@ test_loader = torch.utils.data.DataLoader(
     batch_size=args.batch_size, shuffle=True, **kwargs)
 
 
+def one_hot(x, param_dim):
+    one_hot_size = x.size() + (param_dim,)
+    one_hot = torch.zeros(one_hot_size).view(-1, param_dim).cuda()
+    one_hot.scatter_(-1, x.view(-1, 1), 1)
+    return one_hot.view(one_hot_size)
+
+
 def sample_gumbel(shape, eps=1e-20):
     U = torch.rand(shape)
     if args.cuda:
@@ -65,24 +74,47 @@ def gumbel_softmax(logits, temperature, hard=False):
     return: flatten --> [*, n_class] an one-hot vector
     """
     y = gumbel_softmax_sample(logits, temperature)
-    
+
     if not hard:
-        return y.view(-1, latent_dim * categorical_dim)
+        return y#.view(-1, latent_dim * param_dim)
+
+    import ipdb; ipdb.set_trace()
 
     shape = y.size()
-    _, ind = y.max(dim=-1)
-    y_hard = torch.zeros_like(y).view(-1, shape[-1])
-    y_hard.scatter_(1, ind.view(-1, 1), 1)
-    y_hard = y_hard.view(*shape)
+    ind = y.argmax(dim=-1)
+    y_hard = one_hot(ind, y.size(-1))
     # Set gradients w.r.t. y_hard gradients w.r.t. y
     y_hard = (y_hard - y).detach() + y
-    return y_hard.view(-1, latent_dim * categorical_dim)
+    return y_hard
 
 
-class AutoencoderBase(nn.Module):
+def saturating_sigmoid(logits):
+    return torch.clamp(torch.clamp(1.2 * torch.sigmoid(logits) - 0.1, max=1), min=0)
 
-    def __init__(self, hidden_dim):
+
+def mix(a, b, prob=0.5):
+    mask = (torch.rand_like(a) < prob).float()
+    return mask * a + (1 - mask) * b
+
+
+def improved_semantic_hashing(logits, noise_std):
+    noise = torch.normal(mean=torch.zeros_like(logits), std=noise_std)
+    noisy_logits = logits + noise
+    continuous = saturating_sigmoid(noisy_logits)
+    discrete = (noisy_logits > 0).float() + continuous - continuous.detach()
+    return mix(continuous, discrete)
+
+
+class CategoricalAutoencoderBase(nn.Module):
+
+    latent_dim = None
+    param_dim = None
+    categorical_dim = None
+    needs_temperature = None
+
+    def __init__(self):
         super().__init__()
+        hidden_dim = self.latent_dim * self.param_dim
 
         self.fc1 = nn.Linear(784, 512)
         self.fc2 = nn.Linear(512, 256)
@@ -92,66 +124,103 @@ class AutoencoderBase(nn.Module):
         self.fc5 = nn.Linear(256, 512)
         self.fc6 = nn.Linear(512, 784)
 
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-
     def encode(self, inp):
-        h1 = self.relu(self.fc1(inp))
-        h2 = self.relu(self.fc2(h1))
-        return self.relu(self.fc3(h2))
+        h1 = F.relu(self.fc1(inp))
+        h2 = F.relu(self.fc2(h1))
+        return F.relu(self.fc3(h2)).view(
+            -1, self.latent_dim, self.param_dim
+        )
 
     def decode(self, latent):
-        h4 = self.relu(self.fc4(latent))
-        h5 = self.relu(self.fc5(h4))
-        return self.sigmoid(self.fc6(h5))
+        latent = latent.view(-1, self.latent_dim * self.param_dim)
+        h4 = F.relu(self.fc4(latent))
+        h5 = F.relu(self.fc5(h4))
+        return F.sigmoid(self.fc6(h5))
 
     def latent(self, hidden):
         raise NotImplementedError
+
+    def hard_latent(self, hidden):
+        raise NotImplementedError
+
+    def prior_loss(self, hidden):
+        raise NotImplementedError
+
+    def embed(self, categories):
+        raise NotImplementedError
+
+    def forward(self, inp, *latent_args, **latent_kwargs):
+        hidden = self.encode(inp.view(-1, 784))
+        if self.training:
+            latent = self.latent(hidden, *latent_args, **latent_kwargs)
+            prior_loss = self.prior_loss(hidden)
+        else:
+            latent = self.hard_latent(hidden)
+            prior_loss = None
+        return (self.decode(latent), prior_loss)
+
+
+class GumbelSoftmaxAutoencoder(CategoricalAutoencoderBase):
+
+    needs_temperature = True
+
+    def __init__(self, latent_dim, categorical_dim):
+        self.latent_dim = latent_dim
+        self.param_dim = categorical_dim
+        self.categorical_dim = categorical_dim
+        super().__init__()
+
+    def latent(self, hidden, temp, hard=False):
+        return gumbel_softmax(hidden, temp, hard)
+
+    def hard_latent(self, hidden):
+        return self.embed(torch.argmax(hidden, dim=-1))
+
+    def prior_loss(self, hidden):
+        posterior = F.softmax(hidden, dim=-1).reshape(hidden.size(0), -1)
+        log_ratio = torch.log(posterior * self.param_dim + 1e-20)
+        return torch.sum(posterior * log_ratio, dim=-1).mean()
+
+    def embed(self, categories):
+        return one_hot(categories, self.categorical_dim)
+
+
+class DiscreteAutoencoder(CategoricalAutoencoderBase):
+
+    param_dim = 1
+    categorical_dim = 2
+    needs_temperature = False
+
+    def __init__(self, discretization, latent_dim):
+        self.latent_dim = latent_dim
+        super().__init__()
+        self.discretization = discretization
+
+    def latent(self, hidden):
+        return self.discretization(hidden)
+
+    def hard_latent(self, hidden):
+        return (hidden > 0.5).float()
 
     def prior_loss(self, hidden):
         return 0.0
 
-    def forward(self, inp, *latent_args, **latent_kwargs):
-        hidden = self.encode(inp.view(-1, 784))
-        latent = self.latent(hidden, *latent_args, **latent_kwargs)
-        return (self.decode(latent), self.prior_loss(hidden))
-
-
-class DiscreteAutoencoderBase(AutoencoderBase):
-
-    def __init__(self, latent_dim, categorical_dim):
-        super().__init__(latent_dim * categorical_dim)
-        self.latent_dim = latent_dim
-        self.categorical_dim = categorical_dim
-
-    def _logits(self, hidden):
-        return hidden.view(hidden.size(0), self.latent_dim, self.categorical_dim)
-
-
-class GumbelSoftmaxAutoencoder(DiscreteAutoencoderBase):
-
-    def latent(self, hidden, temp, hard):
-        return gumbel_softmax(self._logits(hidden), temp, hard)
-
-    def prior_loss(self, hidden):
-        posterior = F.softmax(self._logits(hidden), dim=-1).reshape(*hidden.size())
-        log_ratio = torch.log(posterior * self.categorical_dim + 1e-20)
-        return torch.sum(posterior * log_ratio, dim=-1).mean()
-
-
-class DiscreteAutoencoder(DiscreteAutoencoderBase):
-
-    def latent(self, hidden):
-        raise NotImplementedError
+    def embed(self, categories):
+        return categories.float()
 
 
 latent_dim = 30
-categorical_dim = 10  # one-of-K vector
+param_dim = 10  # one-of-K vector
 
 temp_min = 0.5
 ANNEAL_RATE = 0.00003
 
-model = GumbelSoftmaxAutoencoder(latent_dim, categorical_dim)
+#model = GumbelSoftmaxAutoencoder(latent_dim=30, categorical_dim=10)
+model = DiscreteAutoencoder(
+    discretization=functools.partial(improved_semantic_hashing, noise_std=1),
+    latent_dim=100,
+)
+model_kwargs = {}
 if args.cuda:
     model.cuda()
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
@@ -159,18 +228,23 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 # Reconstruction + KL divergence losses summed over all elements and batch
 def loss_function(recon_x, x, prior_loss):
-    BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), size_average=False) / x.shape[0]
-    return BCE + prior_loss
+    loss = F.binary_cross_entropy(recon_x, x.view(-1, 784), size_average=False) / x.shape[0]
+    if prior_loss is not None:
+        loss += prior_loss
+    return loss
 
 
-def train(epoch, temp):
+def train(epoch, temp, **model_kwargs):
     model.train()
+    model_kwargs = copy.copy(model_kwargs)
     train_loss = 0
     for batch_idx, (data, _) in enumerate(train_loader):
         if args.cuda:
             data = data.cuda()
         optimizer.zero_grad()
-        recon_batch, prior_loss = model(data, temp, args.hard)
+        if model.needs_temperature:
+            model_kwargs["temp"] = temp
+        recon_batch, prior_loss = model(data, **model_kwargs)
         loss = loss_function(recon_batch, data, prior_loss)
         loss.backward()
         train_loss += loss.item() * len(data)
@@ -190,13 +264,13 @@ def train(epoch, temp):
     return temp
 
 
-def test(epoch):
+def test(epoch, **model_kwargs):
     model.eval()
     test_loss = 0
     for i, (data, _) in enumerate(test_loader):
         if args.cuda:
             data = data.cuda()
-        recon_batch, prior_loss = model(data, temp_min, args.hard)
+        recon_batch, prior_loss = model(data, **model_kwargs)
         test_loss += loss_function(recon_batch, data, prior_loss).item() * len(data)
         if i == 0:
             n = min(data.size(0), 8)
@@ -212,18 +286,18 @@ def test(epoch):
 def run():
     temp = args.temp
     for epoch in range(1, args.epochs + 1):
-        temp = train(epoch, temp)
+        temp = train(epoch, temp, **model_kwargs)
         test(epoch)
 
-        M = 64 * latent_dim
-        np_y = np.zeros((M, categorical_dim), dtype=np.float32)
-        np_y[range(M), np.random.choice(categorical_dim, M)] = 1
-        np_y = np.reshape(np_y, [M // latent_dim, latent_dim, categorical_dim])
-        sample = torch.from_numpy(np_y).view(M // latent_dim, latent_dim * categorical_dim)
+        num_examples = 64
+        sample = torch.randint(
+            high=model.categorical_dim,
+            size=(num_examples, model.latent_dim),
+        )
         if args.cuda:
             sample = sample.cuda()
-        sample = model.decode(sample).cpu()
-        save_image(sample.data.view(M // latent_dim, 1, 28, 28),
+        sample = model.decode(model.embed(sample)).cpu()
+        save_image(sample.data.view(num_examples, 1, 28, 28),
                    'data/sample_' + str(epoch) + '.png')
 
 
