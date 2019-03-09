@@ -201,7 +201,7 @@ class DiscreteAutoencoder(CategoricalAutoencoderBase):
         return self.discretization(hidden)
 
     def hard_latent(self, hidden):
-        return (hidden > 0.0).long()
+        return (hidden > 0.0).long().view(*hidden.size()[:-1])
 
     def prior_loss(self, hidden):
         return 0.0
@@ -212,26 +212,43 @@ class DiscreteAutoencoder(CategoricalAutoencoderBase):
 
 class LatentPredictor(nn.Module):
 
-    def __init__(self, hidden_dim, categorical_dim):
+    def __init__(
+        self, hidden_dim, categorical_dim, num_digits_at_once=8, embedding_dim=64
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.categorical_dim = categorical_dim
+        self.num_digits_at_once = num_digits_at_once
+        self.num_codes = categorical_dim ** num_digits_at_once
+        self.embedding_dim = embedding_dim
+        self.embedding = nn.Embedding(self.num_codes, self.embedding_dim)
         self.rnn = nn.LSTM(
-            input_size=categorical_dim,
+            input_size=self.embedding_dim,
             hidden_size=hidden_dim,
             batch_first=True,
         )
-        self.output = nn.Linear(hidden_dim, categorical_dim)
+        self.output = nn.Linear(hidden_dim, self.num_codes)
 
     def reset(self, batch_size):
-        self.hidden_state = tuple(
-            torch.zeros(self.rnn.num_layers, batch_size, self.hidden_dim)
-            for _ in range(2)
+        def zeros():
+            x = torch.zeros(self.rnn.num_layers, batch_size, self.hidden_dim)
+            if args.cuda:
+                x = x.cuda()
+            return x
+
+        self.hidden_state = tuple(zeros() for _ in range(2))
+
+    def chunk_latent(self, latent):
+        (_, latent_dim) = latent.size()
+        latent = latent.view(
+            -1, latent_dim // self.num_digits_at_once, self.num_digits_at_once
+        )
+        return sum(
+            2 ** i * latent[:, :, -(i + 1)] for i in range(self.num_digits_at_once)
         )
 
-    def forward(self, latent):
-        latent = latent.view(*latent.size()[:-1])
-        input = one_hot(latent, self.categorical_dim)
+    def forward(self, chunked_latent):
+        input = self.embedding(chunked_latent)
         (output, self.hidden_state) = self.rnn(input, self.hidden_state)
         return self.output(output)
 
@@ -240,6 +257,9 @@ class LatentPredictor(nn.Module):
         self.eval()
         prediction = torch.zeros(batch_size, latent_dim)
         latent = torch.zeros(batch_size, 1, 1, dtype=torch.long)
+        if args.cuda:
+            prediction = prediction.cuda()
+            latent = latent.cuda()
         for i in range(latent_dim):
             latent_dist = torch.distributions.Categorical(logits=self(latent))
             latent = latent_dist.sample().view(-1, 1, 1)
@@ -256,11 +276,11 @@ ANNEAL_RATE = 0.00003
 #autoencoder = GumbelSoftmaxAutoencoder(latent_dim=30, categorical_dim=10)
 autoencoder = DiscreteAutoencoder(
     discretization=functools.partial(improved_semantic_hashing, noise_std=1),
-    latent_dim=100,
+    latent_dim=96,
 )
 autoencoder_kwargs = {}
 predictor = LatentPredictor(
-    hidden_dim=64, categorical_dim=autoencoder.categorical_dim
+    hidden_dim=512, categorical_dim=autoencoder.categorical_dim
 )
 if args.cuda:
     autoencoder.cuda()
@@ -328,10 +348,21 @@ def train(epoch, temp, **autoencoder_kwargs):
 def test(epoch, **autoencoder_kwargs):
     autoencoder.eval()
     test_loss = 0
+    test_predictor_loss = 0
     for i, (data, _) in enumerate(test_loader):
         if args.cuda:
             data = data.cuda()
         recon_batch, prior_loss = autoencoder(data, **autoencoder_kwargs)
+
+        hard_latent = autoencoder.hard_latent(autoencoder.encode(data))
+        predictor.reset(data.size(0))
+        prediction = predictor(hard_latent)
+        predictor_loss = F.cross_entropy(
+            prediction[:, :-1, :].contiguous().view(-1, autoencoder.categorical_dim),
+            hard_latent[:, 1:].contiguous().view(-1),
+        )
+        test_predictor_loss += predictor_loss.item()
+
         test_loss += loss_function(recon_batch, data, prior_loss).item() * len(data)
         if i == 0:
             n = min(data.size(0), 8)
@@ -341,7 +372,9 @@ def test(epoch, **autoencoder_kwargs):
                        'data/reconstruction_' + str(epoch) + '.png', nrow=n)
 
     #test_loss /= len(test_loader.dataset)
-    print('====> Test set loss: {:.4f}'.format(test_loss))
+    print('====> Test set loss: {:.4f} Predictor: {:.4f}'.format(
+        test_loss, test_predictor_loss / len(test_loader))
+    )
 
 
 def run():
