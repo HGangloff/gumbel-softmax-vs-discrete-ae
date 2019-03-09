@@ -249,7 +249,7 @@ class LatentPredictor(nn.Module):
 
     def unchunk_latent(self, chunked_latent):
         latent = []
-        for i in range(self.num_digits_per_chunk):
+        for _ in range(self.num_digits_per_chunk):
             latent.append(chunked_latent % self.categorical_dim)
             chunked_latent //= self.categorical_dim
         return torch.stack(latent, dim=-1).view(chunked_latent.size(0), -1)
@@ -284,7 +284,7 @@ ANNEAL_RATE = 0.00003
 #autoencoder = GumbelSoftmaxAutoencoder(latent_dim=30, categorical_dim=10)
 autoencoder = DiscreteAutoencoder(
     discretization=functools.partial(improved_semantic_hashing, noise_std=1),
-    latent_dim=96,
+    latent_dim=32,
 )
 autoencoder_kwargs = {}
 predictor = LatentPredictor(
