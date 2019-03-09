@@ -15,6 +15,8 @@ from torch.nn import functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
+torch.manual_seed(123)
+
 parser = argparse.ArgumentParser(description='VAE MNIST Example')
 parser.add_argument('--batch-size', type=int, default=100, metavar='N',
                     help='input batch size for training (default: 100)')
@@ -226,6 +228,7 @@ class LatentPredictor(nn.Module):
             input_size=self.embedding_dim,
             hidden_size=hidden_dim,
             batch_first=True,
+            num_layers=2,
         )
         self.output = nn.Linear(hidden_dim, self.num_codes)
 
@@ -275,6 +278,20 @@ class LatentPredictor(nn.Module):
         return self.unchunk_latent(prediction)
 
 
+class Classifier(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(784, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 10)
+
+    def forward(self, input):
+        x = F.relu(self.fc1(input.view(input.size(0), -1)))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
 latent_dim = 30
 param_dim = 10  # one-of-K vector
 
@@ -288,15 +305,18 @@ autoencoder = DiscreteAutoencoder(
 )
 autoencoder_kwargs = {}
 predictor = LatentPredictor(
-    hidden_dim=256, categorical_dim=autoencoder.categorical_dim
+    hidden_dim=128, categorical_dim=autoencoder.categorical_dim
 )
+classifier = Classifier()
 if args.cuda:
     autoencoder.cuda()
     predictor.cuda()
+    classifier = classifier.cuda()
 optimizer = optim.Adam(
     list(autoencoder.parameters()) + list(predictor.parameters()),
     lr=1e-3,
 )
+classifier_optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
 
 
 # Reconstruction + KL divergence losses summed over all elements and batch
@@ -389,7 +409,42 @@ def test(epoch, **autoencoder_kwargs):
     )
 
 
+def train_classifier():
+    def maybe_cuda(x):
+        if args.cuda:
+            x = x.cuda()
+        return x
+
+    classifier.train()
+    for _ in range(3):
+        for batch_idx, (data, labels) in enumerate(train_loader):
+            classifier_optimizer.zero_grad()
+            prediction = classifier(maybe_cuda(data.view(data.size(0), -1)))
+            loss = F.cross_entropy(prediction, maybe_cuda(labels))
+            loss.backward()
+            classifier_optimizer.step()
+
+    classifier.eval()
+    print('Classifier test accuracy: {}'.format(sum(
+        (
+            classifier(
+                maybe_cuda(data.view(data.size(0), -1))
+            ).argmax(dim=-1) == maybe_cuda(labels)
+        ).float().mean()
+        for (data, labels) in test_loader
+    ) / len(test_loader)))
+
+
+def inception_score(images):
+    predictions = F.softmax(classifier(images))
+    marginal = predictions.mean(dim=0)
+    print('Marginal class probabilities: {}'.format(marginal.detach().cpu().numpy()))
+    return (predictions * (torch.log(predictions) - torch.log(marginal))).mean()
+
+
 def run():
+    train_classifier()
+
     temp = args.temp
     for epoch in range(1, args.epochs + 1):
         temp = train(epoch, temp, **autoencoder_kwargs)
@@ -402,16 +457,20 @@ def run():
         )
         if args.cuda:
             sample = sample.cuda()
-        sample = autoencoder.decode(autoencoder.embed(sample)).cpu()
-        save_image(sample.data.view(num_examples, 1, 28, 28),
+        sample = autoencoder.decode(autoencoder.embed(sample)).view(-1, 1, 28, 28)
+        save_image(sample.cpu().data,
                    'data/sample_' + str(epoch) + '.png')
+        print('Independent sampling inception score:', inception_score(sample).item())
 
         sample = predictor.infer(
             batch_size=num_examples, latent_dim=autoencoder.latent_dim
         )
-        sample = autoencoder.decode(autoencoder.embed(sample)).cpu()
-        save_image(sample.data.view(num_examples, 1, 28, 28),
+        sample = autoencoder.decode(autoencoder.embed(sample)).view(-1, 1, 28, 28)
+        save_image(sample.cpu().data,
                    'data/sample_rnn_' + str(epoch) + '.png')
+        print('RNN sampling inception score:', inception_score(sample).item())
+
+    print(inception_score(sample).item())
 
 
 if __name__ == '__main__':
