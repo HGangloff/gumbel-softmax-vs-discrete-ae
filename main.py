@@ -15,9 +15,32 @@ from torch.nn import functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
-torch.manual_seed(123)
-
-parser = argparse.ArgumentParser(description='VAE MNIST Example')
+parser = argparse.ArgumentParser(
+    description='Discrete autoencoders on MNIST'
+)
+parser.add_argument('--output-dir', type=str, help='output directory')
+parser.add_argument('--which', type=str, help='which method to use (gumbel or isemhash)')
+parser.add_argument(
+    '--latent-dim', type=int, default=32, help='number of latent variables'
+)
+parser.add_argument(
+    '--categorical-dim', type=int, default=2, help='number of categories'
+)
+parser.add_argument(
+    '--rnn-dim', type=int, default=128, help='dimensionality fo RNN hidden state'
+)
+parser.add_argument(
+    '--rnn-layers', type=int, default=1, help='number of RNN layers'
+)
+parser.add_argument(
+    '--rnn-chunk-size', type=int, default=8, help='number of digits in each chunk in RNN'
+)
+parser.add_argument(
+    '--temp-annealing', type=float, default=0.00003, help='temperature annealing rate'
+)
+parser.add_argument(
+    '--beta', type=float, default=1, help='weight of the KL term in VAE'
+)
 parser.add_argument('--batch-size', type=int, default=100, metavar='N',
                     help='input batch size for training (default: 100)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
@@ -167,13 +190,14 @@ class GumbelSoftmaxAutoencoder(CategoricalAutoencoderBase):
 
     needs_temperature = True
 
-    def __init__(self, latent_dim, categorical_dim):
+    def __init__(self, latent_dim, categorical_dim, beta):
         self.latent_dim = latent_dim
         self.param_dim = categorical_dim
         self.categorical_dim = categorical_dim
+        self.beta = beta
         super().__init__()
 
-    def latent(self, hidden, temp, hard=False):
+    def latent(self, hidden, temp=None, hard=False):
         return gumbel_softmax(hidden, temp, hard)
 
     def hard_latent(self, hidden):
@@ -182,7 +206,7 @@ class GumbelSoftmaxAutoencoder(CategoricalAutoencoderBase):
     def prior_loss(self, hidden):
         posterior = F.softmax(hidden, dim=-1).reshape(hidden.size(0), -1)
         log_ratio = torch.log(posterior * self.param_dim + 1e-20)
-        return torch.sum(posterior * log_ratio, dim=-1).mean()
+        return self.beta * torch.sum(posterior * log_ratio, dim=-1).mean()
 
     def embed(self, categories):
         return one_hot(categories, self.categorical_dim)
@@ -215,7 +239,12 @@ class DiscreteAutoencoder(CategoricalAutoencoderBase):
 class LatentPredictor(nn.Module):
 
     def __init__(
-        self, hidden_dim, categorical_dim, num_digits_per_chunk=8, embedding_dim=64
+        self,
+        num_layers,
+        hidden_dim,
+        categorical_dim,
+        num_digits_per_chunk,
+        embedding_dim=64,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -228,7 +257,7 @@ class LatentPredictor(nn.Module):
             input_size=self.embedding_dim,
             hidden_size=hidden_dim,
             batch_first=True,
-            num_layers=2,
+            num_layers=num_layers,
         )
         self.output = nn.Linear(hidden_dim, self.num_codes)
 
@@ -266,7 +295,7 @@ class LatentPredictor(nn.Module):
         self.reset(batch_size)
         self.eval()
         latent_dim //= self.num_digits_per_chunk
-        prediction = torch.zeros(batch_size, latent_dim)
+        prediction = torch.zeros(batch_size, latent_dim, dtype=torch.long)
         latent = torch.zeros(batch_size, 1, dtype=torch.long)
         if args.cuda:
             prediction = prediction.cuda()
@@ -292,26 +321,28 @@ class Classifier(nn.Module):
         return self.fc3(x)
 
 
-latent_dim = 30
-param_dim = 10  # one-of-K vector
-
 temp_min = 0.5
-ANNEAL_RATE = 0.00003
 
-#autoencoder = GumbelSoftmaxAutoencoder(latent_dim=30, categorical_dim=10)
-autoencoder = DiscreteAutoencoder(
-    discretization=functools.partial(improved_semantic_hashing, noise_std=1),
-    latent_dim=32,
-)
-autoencoder_kwargs = {}
+autoencoder = {
+    'gumbel': lambda: GumbelSoftmaxAutoencoder(
+        latent_dim=args.latent_dim, categorical_dim=args.categorical_dim, beta=args.beta
+    ),
+    'isemhash': lambda: DiscreteAutoencoder(
+        discretization=functools.partial(improved_semantic_hashing, noise_std=1),
+        latent_dim=args.latent_dim,
+    )
+}[args.which]()
 predictor = LatentPredictor(
-    hidden_dim=128, categorical_dim=autoencoder.categorical_dim
+    num_layers=args.rnn_layers,
+    hidden_dim=args.rnn_dim,
+    categorical_dim=autoencoder.categorical_dim,
+    num_digits_per_chunk=args.rnn_chunk_size,
 )
 classifier = Classifier()
 if args.cuda:
     autoencoder.cuda()
     predictor.cuda()
-    classifier = classifier.cuda()
+    classifier.cuda()
 optimizer = optim.Adam(
     list(autoencoder.parameters()) + list(predictor.parameters()),
     lr=1e-3,
@@ -357,7 +388,7 @@ def train(epoch, temp, **autoencoder_kwargs):
         train_loss += autoencoder_loss.item() * len(data)
         optimizer.step()
         if batch_idx % 100 == 1:
-            temp = np.maximum(temp * np.exp(-ANNEAL_RATE * 100), temp_min)
+            temp = np.maximum(temp * np.exp(-args.temp_annealing * 100), temp_min)
 
         if batch_idx % args.log_interval == 0:
             print(
@@ -395,18 +426,23 @@ def test(epoch, **autoencoder_kwargs):
         )
         test_predictor_loss += predictor_loss.item()
 
-        test_loss += loss_function(recon_batch, data, prior_loss).item() * len(data)
+        test_loss += loss_function(recon_batch, data, prior_loss).item()
         if i == 0:
             n = min(data.size(0), 8)
             comparison = torch.cat([data[:n],
                                     recon_batch.view(args.batch_size, 1, 28, 28)[:n]])
-            save_image(comparison.data.cpu(),
-                       'data/reconstruction_' + str(epoch) + '.png', nrow=n)
+            save_image(
+                comparison.data.cpu(),
+                args.output_dir + '/reconstruction_' + str(epoch) + '.png',
+                nrow=n,
+            )
 
-    #test_loss /= len(test_loader.dataset)
+    test_loss /= len(test_loader)
+    test_predictor_loss /= len(test_loader)
     print('====> Test set loss: {:.4f} Predictor: {:.4f}'.format(
-        test_loss, test_predictor_loss / len(test_loader))
-    )
+        test_loss, test_predictor_loss
+    ))
+    return test_loss
 
 
 def train_classifier():
@@ -447,8 +483,8 @@ def run():
 
     temp = args.temp
     for epoch in range(1, args.epochs + 1):
-        temp = train(epoch, temp, **autoencoder_kwargs)
-        test(epoch)
+        temp = train(epoch, temp)
+        reconstruction_loss = test(epoch)
 
         num_examples = 64
         sample = torch.randint(
@@ -457,20 +493,28 @@ def run():
         )
         if args.cuda:
             sample = sample.cuda()
-        sample = autoencoder.decode(autoencoder.embed(sample)).view(-1, 1, 28, 28)
-        save_image(sample.cpu().data,
-                   'data/sample_' + str(epoch) + '.png')
-        print('Independent sampling inception score:', inception_score(sample).item())
+        ind_sample = autoencoder.decode(
+            autoencoder.embed(sample)
+        ).view(-1, 1, 28, 28)
+        save_image(ind_sample.cpu().data,
+                   args.output_dir + '/sample_' + str(epoch) + '.png')
+        print(
+            'Independent sampling inception score:', inception_score(ind_sample).item()
+        )
 
-        sample = predictor.infer(
+        rnn_sample = predictor.infer(
             batch_size=num_examples, latent_dim=autoencoder.latent_dim
         )
-        sample = autoencoder.decode(autoencoder.embed(sample)).view(-1, 1, 28, 28)
-        save_image(sample.cpu().data,
-                   'data/sample_rnn_' + str(epoch) + '.png')
-        print('RNN sampling inception score:', inception_score(sample).item())
+        rnn_sample = autoencoder.decode(
+            autoencoder.embed(rnn_sample)
+        ).view(-1, 1, 28, 28)
+        save_image(rnn_sample.cpu().data,
+                   args.output_dir + '/sample_rnn_' + str(epoch) + '.png')
+        print('RNN sampling inception score:', inception_score(rnn_sample).item())
 
-    print(inception_score(sample).item())
+    print(reconstruction_loss)
+    print(inception_score(ind_sample).item())
+    print(inception_score(rnn_sample).item())
 
 
 if __name__ == '__main__':
